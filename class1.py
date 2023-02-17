@@ -44,5 +44,42 @@ def freq_string(ch,s):
 
 print(freq_string('a','aabcg'))
 
+def comm_element(a,b):
+    commelem_arr=[]
+    for i in a:
+        if i in b:
+            commelem_arr.append(i)
+    
+    return commelem_arr
+
+def fib_num(n):
+    if n==0:
+        return 0
+    if n==1:
+        return 1
+    else:
+        return fib_num(n-1)+fib_num(n-2)
+
+def prime_numbers(n):
+    primen=[]
+    for i in range(1,n-1):
+        occ=0
+        for j in range(1,j):
+            if(i%j==0):
+                occ+=1
+        if(occ>0):
+            primen.append(i)
+    return primen
+
+def palin(s):
+    rev_s=''
+    for i in s:
+        rev_s=i+rev_s
+    if rev_s==s:
+        return 'String is palindrome'
+ 
+    
+    
+
         
     
