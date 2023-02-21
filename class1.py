@@ -52,6 +52,8 @@ def comm_element(a,b):
     
     return commelem_arr
 
+print(comm_element([1,2,3],[2,4,6]))
+
 def fib_num(n):
     if n==0:
         return 0
@@ -60,16 +62,20 @@ def fib_num(n):
     else:
         return fib_num(n-1)+fib_num(n-2)
 
+print(fib_num(4))
+
 def prime_numbers(n):
-    primen=[]
+    primen=[1]
     for i in range(1,n-1):
         occ=0
-        for j in range(1,j):
+        for j in range(2,i):
             if(i%j==0):
                 occ+=1
         if(occ>0):
             primen.append(i)
     return primen
+
+print(prime_numbers(6))
 
 def palin(s):
     rev_s=''
@@ -79,7 +85,7 @@ def palin(s):
         return 'String is palindrome'
  
     
-    
+print(palin('eee'))
 
         
     
