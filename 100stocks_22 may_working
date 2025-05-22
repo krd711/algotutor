@@ -1,0 +1,1137 @@
+# -*- coding: utf-8 -*-
+import csv
+import time
+import logging
+import requests
+import datetime
+import platform
+import math # Added for isnan checks
+import threading # Added for cooldown locks
+from dateutil.relativedelta import relativedelta # For date calculations
+import json # For caching instruments (might be adapted for stock details if needed)
+import traceback # For detailed error printing
+import os # For checking file existence
+import functools # For the Deprecated decorator
+
+from kiteconnect import KiteConnect, KiteTicker # Import Kite classes
+
+# --- Determine script directory for path resolution ---
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# --- Sound Helper (Keep outside class) --- 
+if platform.system() == "Windows":
+    import winsound
+    def play_sound():
+        winsound.Beep(1000, 500)
+else:
+    def play_sound():
+        logging.info("Sound alert would play here.")
+# ----------------------------------------
+
+# --- Static Calculation Helper (Keep outside class) ---
+def compute_sma(data, period):
+    """Calculates the Simple Moving Average."""
+    if len(data) < period:
+        return None
+    if period <= 0:
+        return None
+    try:
+        return sum(data[-period:]) / period
+    except TypeError:
+        logging.error("Could not compute SMA due to non-numeric data in last {} elements.".format(period))
+        return None
+# ----------------------------------------
+
+# --- JSON Date Handler (Keep outside class) ---
+def json_date_handler(obj):
+    """JSON serializer for objects not serializable by default json code"""
+    if isinstance(obj, (datetime.datetime, datetime.date)):
+        return obj.isoformat()
+    raise TypeError ("Type %s not serializable" % type(obj))
+# ----------------------------------------
+
+# --- Configuration Constants (Keep outside class) ---
+API_KEY = "8s196l1kl74abu5c" # Replace with your actual API Key
+ACCESS_TOKEN = "NtEfOZepVg2R3uDg7S7rySoiguGPIqz9"  # Replace with your actual Access Token
+
+ORDERS_LOG_CSV = os.path.join(SCRIPT_DIR, "orders_log.csv")
+HISTORICAL_CANDLES_CSV = os.path.join(SCRIPT_DIR, "historical_stock_candles.csv")
+PNL_LOG_CSV = os.path.join(SCRIPT_DIR, "pnl_log.csv")
+LIQUID_STOCKS_CSV = os.path.join(SCRIPT_DIR, "liquid_stocks.csv")
+
+PRICE_CHANGE_THRESHOLD_MIN_PCT = 2.0  # Minimum price change percentage for trade
+PRICE_CHANGE_THRESHOLD_MAX_PCT = 8.0  # Maximum price change percentage for trade
+EQUITY_SL_PCT = 1.0                   # Stop-loss percentage for equity trades (of entry price)
+EQUITY_TARGET_PCT = 2.0               # Target percentage for equity trades (of entry price)
+EQUITY_TRAIL_SL_PROFIT_PCT = 1.0      # When target is hit, trail SL to lock in this % of profit from entry.
+                                      # e.g. if entry=100, target=102, SL_TRAIL_PROFIT_PCT=1.0, new SL = 100 + (100*1/100) = 101
+
+CANDLE_INTERVAL_MINUTES_PRIMARY = 15
+CANDLE_INTERVAL_MINUTES_SECONDARY = 5
+SUPPORTED_INTERVALS = ["{}minute".format(CANDLE_INTERVAL_MINUTES_SECONDARY), "{}minute".format(CANDLE_INTERVAL_MINUTES_PRIMARY)]
+# Ensure primary is last if any logic depends on processing order or if its historicals are the main save source
+
+VOLUME_AVG_PERIOD = 10
+MIN_BODY_SIZE_PCT = 0.0005 # Optional: Minimum candle body size as percentage of close
+VOL_MULTIPLIER = 1.5
+COOLDOWN_MINS_STOCK = 60 # Cooldown per stock
+POLL_OFFSET_SECONDS = 5 # Offset after candle completion to start polling
+
+MONITOR_INTERVAL_SECONDS = 5
+# STOCK_DATA_POLL_INTERVAL_SECONDS = CANDLE_INTERVAL_MINUTES * 60 # Poll every 15 minutes - This will be dynamic now
+
+ALLOW_BULLISH_SIGNALS = True
+ALLOW_BEARISH_SIGNALS = True # Ensure your broker allows MIS short selling for selected stocks
+
+WEBHOOK_URL = (
+    "https://script.google.com/macros/s/AKfycbz5T6u2SvZ2p9tw2VSWHRDAUYVQCwpWmUjfgdsViA_kc5n9t5Fri4Pnx8YQ6QFvTt4kMA/exec"
+)
+TELEGRAM_BOT_TOKEN = "8114304856:AAHUljhplGDvi565oNNGtWGrqeYpOHWfnek" # Replace with your Bot Token
+TELEGRAM_CHAT_ID = ["613191986", "6036008011"] # List of Chat IDs (or recipient User IDs)
+# -----------------------------------------
+
+# --- Deprecated Decorator ---
+class Deprecated:
+    def __init__(self, f):
+        self.f = f
+        functools.update_wrapper(self, f)
+    def __call__(self, *args, **kwargs):
+        logging.warning("Call to deprecated function: {}".format(self.f.__name__))
+        return self.f(*args, **kwargs)
+# ---------------------------
+
+class StrategyRunner:
+    def __init__(self, kite_connect_instance):
+        logging.info("Initializing StrategyRunner for Equity Breakout Strategy...")
+        self.kite = kite_connect_instance
+        self.active_trades = {}
+        self.active_trades_lock = threading.Lock()
+        
+        self.liquid_stocks = self._load_liquid_stocks()
+        
+        if not self.liquid_stocks:
+            raise ValueError("Failed to load liquid stocks. Check liquid_stocks.csv and Kite instrument master.")
+
+        self.instrument_trading_status = {stock['symbol']: True for stock in self.liquid_stocks}
+        self.cooldown_locks = {stock['symbol']: threading.Lock() for stock in self.liquid_stocks}
+        
+        self.current_candles = {
+            stock['symbol']: { # This structure might need review if used extensively with multiple intervals
+                interval: {"date": None, "open": None, "high": None, "low": None, "close": None, "volume": None}
+                for interval in SUPPORTED_INTERVALS
+            }
+            for stock in self.liquid_stocks
+        }
+        self.candles_data = {
+            stock['symbol']: {interval: [] for interval in SUPPORTED_INTERVALS}
+            for stock in self.liquid_stocks
+        }
+        self.historical_candles = {
+            stock['symbol']: {interval: [] for interval in SUPPORTED_INTERVALS}
+            for stock in self.liquid_stocks
+        }
+        self.cooldowns = { # Cooldowns remain per-stock for now
+            stock['symbol']: {"lastBullAlert": None, "lastBearAlert": None}
+            for stock in self.liquid_stocks
+        }
+        self.current_poll_price_movers = [] # For summarizing movers each poll cycle
+        self.current_poll_all_stock_changes = [] # For summarizing overall top movers
+        
+        self.stock_configs = {
+            stock['symbol']: {
+                "name": stock['symbol'],
+                "exchange": stock['exchange'],
+                "instrument_token": stock['instrument_token'],
+                "quantity": 100, # Default, can be overridden or made dynamic
+                "sl_pct": EQUITY_SL_PCT,
+                "target_pct": EQUITY_TARGET_PCT,
+                "trail_sl_profit_pct": EQUITY_TRAIL_SL_PROFIT_PCT
+            } for stock in self.liquid_stocks
+        }
+
+        logging.info("Loaded {} liquid stocks for trading.".format(len(self.liquid_stocks)))
+        logging.info("Stock configs initialized for: {}".format([s['symbol'] for s in self.liquid_stocks]))
+
+        monitor_thread = threading.Thread(target=self._monitor_active_trades_loop, daemon=True)
+        monitor_thread.start()
+        logging.info("Active trade monitoring thread started.")
+
+        polling_thread = threading.Thread(target=self._poll_stock_data_periodically, daemon=True)
+        polling_thread.start()
+        logging.info("Periodic stock data polling thread started (dynamically aligned to intervals: {}).".format(SUPPORTED_INTERVALS))
+
+    def _load_liquid_stocks(self):
+        stocks = []
+        try:
+            logging.info("Fetching instrument dump from Kite (NSE & BSE)...")
+            instrument_dump_nse = self.kite.instruments(exchange=self.kite.EXCHANGE_NSE)
+            instrument_dump_bse = self.kite.instruments(exchange=self.kite.EXCHANGE_BSE)
+            all_instruments_kite = instrument_dump_nse + instrument_dump_bse
+            logging.info("Fetched {} instruments in total from Kite.".format(len(all_instruments_kite)))
+            
+            instrument_lookup = {
+                (inst['tradingsymbol'], inst['exchange']): inst['instrument_token']
+                for inst in all_instruments_kite if inst.get('instrument_type') == 'EQ'
+            }
+            logging.info("Created instrument lookup for {} EQ instruments.".format(len(instrument_lookup)))
+
+        except Exception as e:
+            logging.error("Failed to fetch instrument dump from Kite: {}. Cannot map stock symbols to tokens.".format(e))
+            return stocks
+
+        try:
+            with open(LIQUID_STOCKS_CSV, mode='r', encoding='utf-8') as file:
+                reader = csv.DictReader(file)
+                missing_tokens = []
+                for row in reader:
+                    symbol = row.get('SYMBOL', '').strip().upper()
+                    exchange_str = row.get('EXCHANGE', '').strip().upper()
+                    
+                    if not symbol or not exchange_str:
+                        logging.warning("Skipping row with missing SYMBOL or EXCHANGE: {}".format(row))
+                        continue
+
+                    exchange_kite = None
+                    if exchange_str == "NSE": exchange_kite = self.kite.EXCHANGE_NSE
+                    elif exchange_str == "BSE": exchange_kite = self.kite.EXCHANGE_BSE
+                    else: logging.warning("Unsupported exchange '{}' for symbol '{}'. Skipping.".format(exchange_str, symbol)); continue
+                    
+                    token = instrument_lookup.get((symbol, exchange_kite))
+                    
+                    if token:
+                        stocks.append({"symbol": symbol, "exchange": exchange_kite, "instrument_token": token})
+                    else:
+                        missing_tokens.append("{} ({})".format(symbol, exchange_kite))
+                        logging.warning("Instrument token not found for {} on {}. Skipped.".format(symbol, exchange_kite))
+            
+            if missing_tokens:
+                logging.warning("Could not find tokens for: {}. Check LIQUID_STOCKS_CSV.".format(', '.join(missing_tokens)))
+
+        except FileNotFoundError:
+            logging.error("{} not found. Please create it with SYMBOL,EXCHANGE columns.".format(LIQUID_STOCKS_CSV))
+        except Exception as e:
+            logging.error("Error reading {} or processing instruments: {}".format(LIQUID_STOCKS_CSV, e))
+        
+        logging.info("Successfully loaded and mapped {} stocks from {}.".format(len(stocks), LIQUID_STOCKS_CSV))
+        return stocks
+
+    def set_instrument_trading_status(self, stock_symbol, enabled):
+        stock_symbol_upper = stock_symbol.upper()
+        if stock_symbol_upper in self.instrument_trading_status:
+            self.instrument_trading_status[stock_symbol_upper] = enabled
+            logging.info("Trading for {} has been {}.".format(stock_symbol_upper, 'ENABLED' if enabled else 'DISABLED'))
+        else:
+            logging.warning("Stock symbol '{}' not found. Cannot update status.".format(stock_symbol_upper))
+
+    def load_historical_candles(self):
+        # Hist will load data for the primary interval from the CSV
+        # Other intervals in self.historical_candles will remain empty unless populated by API
+        primary_interval_str = "{}minute".format(CANDLE_INTERVAL_MINUTES_PRIMARY)
+        hist_for_primary_interval = {stock['symbol']: [] for stock in self.liquid_stocks}
+
+        try:
+            with open(HISTORICAL_CANDLES_CSV, "r") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    try:
+                        symbol = row["symbol"].strip().upper()
+                        if symbol in hist_for_primary_interval: # Check against keys of hist_for_primary_interval
+                            hist_for_primary_interval[symbol].append({
+                                "date": datetime.datetime.fromisoformat(row["date"]), "open": float(row["open"]),
+                                "high": float(row["high"]), "low": float(row["low"]),
+                                "close": float(row["close"]), "volume": float(row["volume"])
+                            })
+                    except (ValueError, KeyError) as parse_err:
+                         logging.warning("Skipping invalid row in {}: {} - Error: {}".format(HISTORICAL_CANDLES_CSV, row, parse_err))
+            
+            for symbol_key in hist_for_primary_interval:
+                # Sort and limit candles for the primary interval
+                sorted_candles = sorted(hist_for_primary_interval[symbol_key], key=lambda x: x["date"])
+                self.historical_candles[symbol_key][primary_interval_str] = sorted_candles[-200:]
+            
+            logging.info("Loaded {} hist candles for {} from {}".format(sum(len(v.get(primary_interval_str, [])) for v in self.historical_candles.values()), primary_interval_str, HISTORICAL_CANDLES_CSV))
+        
+        except FileNotFoundError:
+             logging.info("{} not found. Initializing empty historicals for {}.".format(HISTORICAL_CANDLES_CSV, primary_interval_str))
+             # self.historical_candles is already initialized with empty lists for all intervals
+        except Exception as e:
+            logging.error("Error loading {}: {}".format(HISTORICAL_CANDLES_CSV, e))
+            # self.historical_candles remains as initialized
+            
+    def save_historical_candles(self):
+        # Save only the primary interval's candles to CSV
+        primary_interval_str = "{}minute".format(CANDLE_INTERVAL_MINUTES_PRIMARY)
+        with open(HISTORICAL_CANDLES_CSV, "w", newline="") as f:
+            fieldnames = ["symbol", "date", "open", "high", "low", "close", "volume"]
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            for symbol_key, interval_data in self.historical_candles.items():
+                candles_to_save = interval_data.get(primary_interval_str, [])
+                for candle in candles_to_save:
+                    try:
+                        writer.writerow({
+                            "symbol": symbol_key, "date": candle["date"].isoformat(),
+                            "open": candle["open"], "high": candle["high"], "low": candle["low"],
+                            "close": candle["close"], "volume": candle["volume"]
+                        })
+                    except KeyError as e:
+                         logging.warning("Skipping candle save for {} due to missing key {}: {}".format(primary_interval_str, e, candle))
+
+    def fetch_historical_stock_data(self, stock_symbol, instrument_token, exchange, interval="15minute", candles_to_fetch=50):
+        logging.debug("Fetching hist data for {} (Token: {}), Interval: {}, Candles: {}".format(stock_symbol, instrument_token, interval, candles_to_fetch))
+        now = datetime.datetime.now()
+        
+        if interval.endswith("minute"):
+            minutes_per_candle = int(interval.replace("minute", ""))
+            total_minutes_needed_for_fetch = candles_to_fetch * minutes_per_candle * 1.5 
+            days_to_look_back = min(10, max(3, math.ceil(total_minutes_needed_for_fetch / (6.5 * 60)) + 2 )) 
+            from_delta = relativedelta(days=-days_to_look_back)
+        elif interval == "day":
+            from_delta = relativedelta(days=-(candles_to_fetch + 5))
+        else: # Generic fallback if interval string is unexpected
+            from_delta = relativedelta(days=-(candles_to_fetch + 5)) 
+            logging.warning("Unknown interval '{}' for hist fetch, using day-like calc for {}.".format(interval, stock_symbol))
+
+        to_date = now.replace(second=0, microsecond=0)
+        from_date = to_date + from_delta
+        if from_date > to_date: from_date = to_date - relativedelta(days=1) 
+
+        logging.debug("Fetching hist data for {} from {} to {} for {}.".format(stock_symbol, from_date, to_date, interval))
+        records = None
+        try:
+            records = self.kite.historical_data(instrument_token, from_date, to_date, interval, continuous=False, oi=False)
+        except Exception as e:
+            logging.error("Error fetching history for {}: {}".format(instrument_token, e))
+            return []
+            
+        if not records: return []
+        
+        formatted_candles = [{'date': r['date'], 'open': r['open'], 'high': r['high'], 'low': r['low'], 'close': r['close'], 'volume': r.get('volume',0)} for r in records if isinstance(r,dict) and 'date' in r]
+        if not formatted_candles: return []
+        
+        final_candles = sorted(formatted_candles, key=lambda x: x['date'])
+        result_candles = final_candles[-candles_to_fetch:]
+        logging.debug("Fetched {} hist candles, returning last {} for {}.".format(len(final_candles), len(result_candles), stock_symbol))
+        return result_candles
+
+    def fetch_all_initial_stock_data(self):
+        logging.info("Initializing/Fetching initial candle data for all tracked stocks and intervals...")
+        desired_num_candles = VOLUME_AVG_PERIOD + 10 # Common for all intervals for now
+        primary_interval_str = "{}minute".format(CANDLE_INTERVAL_MINUTES_PRIMARY)
+
+        for stock_info in self.liquid_stocks:
+            stock_symbol = stock_info['symbol']; instrument_token = stock_info['instrument_token']; exchange = stock_info['exchange']
+            
+            for interval_str in SUPPORTED_INTERVALS:
+                logging.debug("Fetching initial data for {} - Interval: {}".format(stock_symbol, interval_str))
+                api_fetched = self.fetch_historical_stock_data(stock_symbol, instrument_token, exchange, interval_str, desired_num_candles)
+                time.sleep(0.4) # Added delay to respect API rate limits
+
+                # Initialize candles_data for the current stock and interval if not already
+                if stock_symbol not in self.candles_data: # Should be pre-initialized
+                    self.candles_data[stock_symbol] = {ivl: [] for ivl in SUPPORTED_INTERVALS}
+                if interval_str not in self.candles_data[stock_symbol]:
+                     self.candles_data[stock_symbol][interval_str] = []
+
+                if api_fetched and len(api_fetched) >= VOLUME_AVG_PERIOD:
+                    self.candles_data[stock_symbol][interval_str] = api_fetched
+                    logging.debug("Using {} fresh API {} candles for {}.".format(len(api_fetched), interval_str, stock_symbol))
+                else: # This means API fetch was not sufficient
+                    log_api_issue = "Fresh API data for {} ({}) insufficient ({}).".format(stock_symbol, interval_str, len(api_fetched) if api_fetched else 0)
+                    
+                    csv_hist_candles_for_interval = self.historical_candles.get(stock_symbol, {}).get(interval_str, [])
+                    csv_cand = list(csv_hist_candles_for_interval[-desired_num_candles:])
+
+                    if len(csv_cand) >= VOLUME_AVG_PERIOD:
+                        self.candles_data[stock_symbol][interval_str] = csv_cand
+                        logging.debug("{} Using {} {} candles from in-memory historicals for {}.".format(log_api_issue, len(csv_cand), interval_str, stock_symbol))
+                    elif api_fetched: # API fetched something, but not enough, and CSV also not enough
+                        self.candles_data[stock_symbol][interval_str] = api_fetched
+                        logging.warning("{} In-memory historicals also short ({}). Using {} from API for {} ({}). SMA may delay.".format(log_api_issue, len(csv_cand), len(api_fetched), stock_symbol, interval_str))
+                    else: # API fetched nothing, and CSV also not enough
+                        logging.warning("{} In-memory historicals also short ({}). Could not seed data for {} (interval {}). API fetch also failed. SMA delay likely.".format(log_api_issue, len(csv_cand), stock_symbol, interval_str))
+                        self.candles_data[stock_symbol][interval_str] = []
+                
+                current_candle_count = len(self.candles_data[stock_symbol][interval_str])
+                if current_candle_count < VOLUME_AVG_PERIOD:
+                    logging.warning("Initial {} ({}) has {} candles. SMA delay likely.".format(stock_symbol, interval_str, current_candle_count))
+                else: 
+                    logging.info("Initial {} ({}) with {} candles. SMA should be available.".format(stock_symbol, interval_str, current_candle_count))
+
+    def _add_to_poll_summary(self, mover_info):
+        """Helper to add identified price mover details to a list for current poll summary."""
+        self.current_poll_price_movers.append(mover_info)
+
+    def _poll_stock_data_periodically(self):
+        logging.info("Stock data polling loop started. Will check for completions for intervals: {}".format(SUPPORTED_INTERVALS))
+        TOP_N_MOVERS_TO_LOG = 5 
+        TOP_N_OVERALL_MOVERS_TO_LOG = 3
+        polling_loop_interval_minutes = min(CANDLE_INTERVAL_MINUTES_PRIMARY, CANDLE_INTERVAL_MINUTES_SECONDARY)
+
+        while True:
+            polling_iteration_start_time = datetime.datetime.now()
+            try:
+                self.current_poll_price_movers.clear()
+                self.current_poll_all_stock_changes.clear()
+                
+                # Calculate the next target poll time
+                current_time_for_alignment = datetime.datetime.now() # Use a fresh now()
+                minutes_past_last_interval_boundary = current_time_for_alignment.minute % polling_loop_interval_minutes
+                
+                if minutes_past_last_interval_boundary == 0 and \
+                   current_time_for_alignment.second == 0 and \
+                   current_time_for_alignment.microsecond == 0:
+                    # Exactly on an interval boundary (e.g. 09:15:00 for a 15-min interval),
+                    # means the current interval *just* completed.
+                    # So, the next completion is one full interval away from the current time.
+                    next_interval_completion_time = current_time_for_alignment.replace(second=0, microsecond=0) + \
+                                                  datetime.timedelta(minutes=polling_loop_interval_minutes)
+                else:
+                    # We are somewhere within an interval.
+                    # Calculate how many minutes to add to the *start* of the current interval block 
+                    # to reach the *next* interval completion time.
+                    # Example: current time 09:17, interval 5 min. minutes_past_last_interval_boundary = 2.
+                    # next_interval_completion_time should be 09:20.
+                    # Start of current interval block: 09:15 (current_time_for_alignment - X minutes_past)
+                    # Add polling_loop_interval_minutes to that start to get the next boundary.
+                    start_of_current_interval_block = current_time_for_alignment.replace(second=0, microsecond=0) - \
+                                                      datetime.timedelta(minutes=minutes_past_last_interval_boundary)
+                    next_interval_completion_time = start_of_current_interval_block + \
+                                                  datetime.timedelta(minutes=polling_loop_interval_minutes)
+
+                next_target_poll_dt = next_interval_completion_time + datetime.timedelta(seconds=POLL_OFFSET_SECONDS)
+
+                # If, due to calculation lag or starting mid-interval, next_target_poll_dt is now in the past 
+                # or too soon (within the offset), advance it by one full polling interval.
+                # This ensures we always wait for the *next* actual candle completion + offset.
+                # Use a fresh datetime.now() for comparison
+                now_for_check = datetime.datetime.now()
+                while next_target_poll_dt <= now_for_check + datetime.timedelta(seconds=POLL_OFFSET_SECONDS -1): # check against now + offset-1 to be safe
+                    next_target_poll_dt = next_target_poll_dt + datetime.timedelta(minutes=polling_loop_interval_minutes)
+                
+                sleep_duration_seconds = (next_target_poll_dt - polling_iteration_start_time).total_seconds()
+                # Ensure sleep is not negative. If it is, means target is in past, so default to POLL_OFFSET_SECONDS sleep.
+                if sleep_duration_seconds < 0: 
+                    sleep_duration_seconds = POLL_OFFSET_SECONDS 
+
+                # Market hours check adjustment
+                # First poll should be for a candle that starts at/after 9:15 AM.
+                # E.g., for 5-min interval, 9:15-9:20 candle. Poll at ~9:20:05.
+                # E.g., for 15-min interval, 9:15-9:30 candle. Poll at ~9:30:05.
+                market_open_minute_calc = 15 + polling_loop_interval_minutes 
+                market_open_hour = 9 + (market_open_minute_calc // 60)
+                market_open_minute = market_open_minute_calc % 60
+                market_open_poll_time = datetime.time(market_open_hour, market_open_minute)
+
+                # Last poll should be for candle ending 15:30. Poll at ~15:30:05.
+                # Allow polls up to 15:31:00 to catch this.
+                market_close_poll_time = datetime.time(15, 31)
+                
+                target_poll_time_object = next_target_poll_dt.time()
+                is_weekday = next_target_poll_dt.weekday() < 5
+
+                if is_weekday and (market_open_poll_time <= target_poll_time_object <= market_close_poll_time):
+                    logging.info("Next poll cycle aligned to {} (driven by {}min base, {}s offset). Sleeping for {:.2f}s.".format(
+                        next_target_poll_dt.strftime('%Y-%m-%d %H:%M:%S'), 
+                        polling_loop_interval_minutes, 
+                        POLL_OFFSET_SECONDS,
+                        sleep_duration_seconds))
+                    time.sleep(sleep_duration_seconds)
+                    
+                    actual_polling_time = datetime.datetime.now()
+                    logging.info("Polling for stock data at {} for intervals: {}".format(actual_polling_time.strftime('%Y-%m-%d %H:%M:%S'), SUPPORTED_INTERVALS))
+
+                    for stock_info in self.liquid_stocks:
+                        stock_symbol = stock_info['symbol']; instrument_token = stock_info['instrument_token']; exchange = stock_info['exchange']
+                        is_sample_stock_for_detailed_log = stock_info['symbol'] in [s['symbol'] for s in self.liquid_stocks[:3]]
+
+                        if not self.stock_configs.get(stock_symbol): 
+                            if is_sample_stock_for_detailed_log: logging.warning("Debug {}: No config. Skipping.".format(stock_symbol))
+                            continue
+
+                        for interval_str in SUPPORTED_INTERVALS:
+                            numeric_interval_minutes = int(interval_str.replace("minute",""))
+                            if is_sample_stock_for_detailed_log: logging.info("Debug {}: Fetching historical data...".format(stock_symbol))
+                            
+                            fetched_candles = self.fetch_historical_stock_data(stock_symbol, instrument_token, exchange, interval_str, 3)
+                            
+                            if is_sample_stock_for_detailed_log:
+                                logging.info("Debug {}: Fetched {} candles. First: {}, Last: {}".format(stock_symbol, len(fetched_candles) if fetched_candles else 0, fetched_candles[0]['date'] if fetched_candles else 'N/A', fetched_candles[-1]['date'] if fetched_candles else 'N/A'))
+
+                            if not fetched_candles: 
+                                if is_sample_stock_for_detailed_log: logging.warning("Debug {}: No candles fetched. Skipping.".format(stock_symbol))
+                                continue
+
+                            candle_to_evaluate = None
+                            if len(fetched_candles) >= 1:
+                                potential_candle = fetched_candles[-1]
+                                potential_candle_start_naive = potential_candle['date'].replace(tzinfo=None)
+                                potential_candle_end_naive = potential_candle_start_naive + datetime.timedelta(minutes=numeric_interval_minutes)
+
+                                if actual_polling_time >= potential_candle_end_naive: 
+                                    candle_to_evaluate = potential_candle
+                                    if is_sample_stock_for_detailed_log: logging.info("Debug {}: Last fetched candle ({}) is COMPLETE.".format(stock_symbol, potential_candle_start_naive.strftime('%H:%M')))
+                                elif len(fetched_candles) >= 2: 
+                                    candle_to_evaluate = fetched_candles[-2]
+                                    if is_sample_stock_for_detailed_log: 
+                                        logging.info("Debug {}: Last fetched candle ({}) is NOT complete. Evaluating previous candle ({}).".format(stock_symbol, potential_candle_start_naive.strftime('%H:%M'), fetched_candles[-2]['date'].replace(tzinfo=None).strftime('%H:%M')))
+                            else:
+                                if is_sample_stock_for_detailed_log: logging.info("Debug {}: Only one candle fetched and it ({}) is NOT complete.".format(stock_symbol, potential_candle_start_naive.strftime('%H:%M')))
+                            
+                            if not candle_to_evaluate:
+                                if is_sample_stock_for_detailed_log: logging.warning("Debug {}: Could not determine a completed candle. Skipping.".format(stock_symbol))
+                                continue
+                            
+                            current_api_candle_date_naive = candle_to_evaluate['date'].replace(tzinfo=None)
+                            
+                            if stock_symbol not in self.candles_data: self.candles_data[stock_symbol] = {ivl: [] for ivl in SUPPORTED_INTERVALS}
+                            if interval_str not in self.candles_data[stock_symbol]: self.candles_data[stock_symbol][interval_str] = []
+
+                            # Determine the timestamp of the last candle actually processed by finalize_stock_candle
+                            last_processed_candle_dt_obj = self.current_candles[stock_symbol][interval_str].get('date')
+                            if last_processed_candle_dt_obj and isinstance(last_processed_candle_dt_obj, datetime.datetime):
+                                last_finalized_date_naive = last_processed_candle_dt_obj.replace(tzinfo=None)
+                            else:
+                                last_finalized_date_naive = datetime.datetime.min
+                            
+                            if is_sample_stock_for_detailed_log: 
+                                logging.info("Debug {}: API candle to eval: {}, Last *processed* candle time: {}".format(stock_symbol, current_api_candle_date_naive.strftime('%H:%M'), last_finalized_date_naive.strftime('%H:%M') if last_finalized_date_naive > datetime.datetime.min else 'None'))
+
+                            if current_api_candle_date_naive > last_finalized_date_naive:
+                                if is_sample_stock_for_detailed_log: logging.info("Debug {}: API candle is NEWER than last processed.".format(stock_symbol))
+                                candle_start_naive = current_api_candle_date_naive
+                                candle_end_naive = candle_start_naive + datetime.timedelta(minutes=numeric_interval_minutes)
+                                
+                                logging.info("New completed {} candle for {} (Start: {}, API End: {}). Finalizing.".format(interval_str, stock_symbol, candle_start_naive.strftime('%H:%M'), candle_end_naive.strftime('%H:%M')))
+                                
+                                candle_to_pass_to_finalize = candle_to_evaluate.copy()
+                                candle_to_pass_to_finalize['date'] = current_api_candle_date_naive 
+
+                                self.finalize_stock_candle(stock_symbol, candle_to_pass_to_finalize, interval_str)
+                        else:
+                                if is_sample_stock_for_detailed_log: logging.info("Debug {}: Selected candle ({}) is NOT newer. Skipping finalization.".format(stock_symbol, current_api_candle_date_naive.strftime('%H:%M')))
+                    # End of for stock_info loop
+                                
+                    if self.current_poll_price_movers:
+                        sorted_movers = sorted(self.current_poll_price_movers, key=lambda x: abs(x['price_change_pct']), reverse=True)
+                        log_msg_header = "Price Movers (Threshold: +/-{:.1f}% to +/-{:.1f}%). Showing top {}:".format(PRICE_CHANGE_THRESHOLD_MIN_PCT, PRICE_CHANGE_THRESHOLD_MAX_PCT, min(TOP_N_MOVERS_TO_LOG, len(sorted_movers)))
+                        logging.info("--- Poll Interval Summary ({}) ---".format(actual_polling_time.strftime('%Y-%m-%d %H:%M:%S')))
+                        logging.info(log_msg_header)
+                        
+                        tg_message_price_movers = "*Poll Price Movers (Threshold: +/-{:.1f}% to +/-{:.1f}%)*\n_{}_\n\n".format(
+                            PRICE_CHANGE_THRESHOLD_MIN_PCT, PRICE_CHANGE_THRESHOLD_MAX_PCT, actual_polling_time.strftime('%Y-%m-%d %H:%M:%S')
+                        )
+                        for mover in sorted_movers[:TOP_N_MOVERS_TO_LOG]:
+                            log_line = "  - {} ({}): {:.2f}% ({}) at {:.2f} (Candle: {})".format(mover['name'], mover['interval'], mover['price_change_pct'], mover['direction'], mover['close'], mover['timestamp'].strftime('%H:%M'))
+                            logging.info(log_line)
+                            tg_message_price_movers += "- `{}` (`{}`): `{:+.2f}%` ({}) at `{:.2f}` (_{}_)\n".format(
+                                mover['name'], mover['interval'], mover['price_change_pct'], mover['direction'], 
+                                mover['close'], mover['timestamp'].strftime('%H:%M')
+                            )
+                        self.send_telegram_notification(tg_message_price_movers)
+                    else:
+                        logging.info("--- Poll Interval Summary ({}) ---".format(actual_polling_time.strftime('%Y-%m-%d %H:%M:%S')))
+                        log_msg_no_movers = "  No stocks met the {:.1f}-{:.1f}% price change threshold during this poll.".format(PRICE_CHANGE_THRESHOLD_MIN_PCT, PRICE_CHANGE_THRESHOLD_MAX_PCT)
+                        logging.info(log_msg_no_movers)
+                        tg_message_no_movers = "*Poll Price Movers (Threshold: +/-{:.1f}% to +/-{:.1f}%)*\n_{}_\n\n{}".format(
+                            PRICE_CHANGE_THRESHOLD_MIN_PCT, PRICE_CHANGE_THRESHOLD_MAX_PCT, 
+                            actual_polling_time.strftime('%Y-%m-%d %H:%M:%S'),
+                            log_msg_no_movers.strip()
+                        )
+                        self.send_telegram_notification(tg_message_no_movers)
+                    
+                    if self.current_poll_all_stock_changes:
+                        sorted_overall_movers = sorted(self.current_poll_all_stock_changes, key=lambda x: abs(x['price_change_pct']), reverse=True)
+                        log_msg_overall_header = "--- Overall Top {} Movers (All Stocks from this poll) ---".format(min(TOP_N_OVERALL_MOVERS_TO_LOG, len(sorted_overall_movers)))
+                        logging.info(log_msg_overall_header)
+
+                        tg_message_overall_movers = "*Overall Top {} Movers (All Stocks)*\n_{}_\n\n".format(
+                            min(TOP_N_OVERALL_MOVERS_TO_LOG, len(sorted_overall_movers)),
+                            actual_polling_time.strftime('%Y-%m-%d %H:%M:%S')
+                        )
+                        for mover in sorted_overall_movers[:TOP_N_OVERALL_MOVERS_TO_LOG]:
+                            direction_symbol = "↑" if mover['price_change_pct'] > 0 else "↓" if mover['price_change_pct'] < 0 else "-"
+                            log_line_overall = "  - {} ({}): {:.2f}% {} at {:.2f} (Candle: {})".format(mover['name'], mover['interval'], mover['price_change_pct'], direction_symbol, mover['close'], mover['timestamp'].strftime('%H:%M'))
+                            logging.info(log_line_overall)
+                            tg_message_overall_movers += "- `{}` (`{}`): `{:+.2f}%` {} at `{:.2f}` (_{}_)\n".format(
+                                mover['name'], mover['interval'], mover['price_change_pct'], direction_symbol, 
+                                mover['close'], mover['timestamp'].strftime('%H:%M')
+                            )
+                        self.send_telegram_notification(tg_message_overall_movers)
+                    else:
+                        # This case might not be hit often if current_poll_all_stock_changes is always populated 
+                        # even with 0% changes, but good to have a log for it.
+                        log_msg_no_overall_data = "  No price change data recorded for overall top movers summary this poll."
+                        logging.info(log_msg_no_overall_data) # Log it, but maybe not worth a TG message if threshold movers already sent one.
+                        # Optionally, send a TG message if needed:
+                        # tg_message_no_overall = "*Overall Top Movers*\n_{}_\n\n{}".format(
+                        #     actual_polling_time.strftime('%Y-%m-%d %H:%M:%S'),
+                        #     log_msg_no_overall_data.strip()
+                        # )
+                        # self.send_telegram_notification(tg_message_no_overall)
+                else:
+                    logging.info("Next aligned poll time {} is outside market hours/days. Sleeping for {:.2f}s.".format(next_target_poll_dt.strftime('%Y-%m-%d %H:%M:%S'), sleep_duration_seconds))
+                    time.sleep(sleep_duration_seconds)
+            except Exception as e:
+                logging.error("Error in _poll_stock_data_periodically loop: {}".format(e))
+                traceback.print_exc()
+                time.sleep(60) 
+
+    def finalize_stock_candle(self, stock_symbol, completed_candle, interval_str):
+        # Check if it's the first 5-minute candle of the day (9:15 AM start time)
+        # CANDLE_INTERVAL_MINUTES_SECONDARY is 5
+        if interval_str == "{}minute".format(CANDLE_INTERVAL_MINUTES_SECONDARY) and \
+           completed_candle['date'].time() == datetime.time(9, 15):
+            logging.info("Skipping analysis of the first {}minute candle (9:15 AM) for {} due to market open volatility.".format(CANDLE_INTERVAL_MINUTES_SECONDARY, stock_symbol))
+            # Optionally, still add to data stores for continuity, but don't process for signals:
+            # if interval_str not in self.candles_data[stock_symbol]: self.candles_data[stock_symbol][interval_str] = []
+            # if interval_str not in self.historical_candles[stock_symbol]: self.historical_candles[stock_symbol][interval_str] = []
+            # self.candles_data[stock_symbol][interval_str].append(completed_candle.copy())
+            # self.historical_candles[stock_symbol][interval_str].append(completed_candle.copy())
+            # self.save_historical_candles() # This saves only primary, so might not be relevant here unless primary is 5min
+            return
+
+        cndl = completed_candle
+        if not all(k in cndl for k in ["date","open","high","low","close","volume"]) or any(cndl[k] is None for k in ["close","open","volume"]):
+            logging.error("Incomplete candle data for {} ({}) finalization: {}. Skipping.".format(stock_symbol, interval_str, cndl))
+            return
+        
+        cfg = self.stock_configs.get(stock_symbol); name = cfg["name"] if cfg else stock_symbol
+        # The model already changed CANDLE_INTERVAL_MINUTES to CANDLE_INTERVAL_MINUTES_PRIMARY here, 
+        # but it should be dynamic based on interval_str passed to this function.
+        # Extracting numeric minutes from interval_str for logging:
+        interval_minutes_for_log = interval_str.replace("minute", "")
+        logging.debug("{} ({}min CNDL) {} O={:.2f},H={:.2f},L={:.2f},C={:.2f},V={}".format(name, interval_minutes_for_log, cndl['date'], cndl['open'], cndl['high'], cndl['low'], cndl['close'], cndl['volume']))
+
+        # Ensure the interval key exists before appending
+        if interval_str not in self.candles_data[stock_symbol]: self.candles_data[stock_symbol][interval_str] = []
+        if interval_str not in self.historical_candles[stock_symbol]: self.historical_candles[stock_symbol][interval_str] = []
+
+        self.candles_data[stock_symbol][interval_str].append(cndl.copy()); self.candles_data[stock_symbol][interval_str] = self.candles_data[stock_symbol][interval_str][-(VOLUME_AVG_PERIOD + 20):]
+        self.historical_candles[stock_symbol][interval_str].append(cndl.copy()); self.historical_candles[stock_symbol][interval_str] = self.historical_candles[stock_symbol][interval_str][-200:]
+        # Save historical_candles (which only saves primary interval by design now)
+        self.save_historical_candles() 
+
+        if not self.instrument_trading_status.get(stock_symbol, True):
+            logging.info("Trading for {} ({}) is DISABLED. Skipping strategy logic.".format(name, interval_str))
+            return
+        if len(self.candles_data[stock_symbol][interval_str]) < 2:
+            logging.debug("Not enough candle data ({}) for {} ({}) to apply strategy. Need 2.".format(len(self.candles_data[stock_symbol][interval_str]), name, interval_str))
+            return
+
+        prev_cndl = self.candles_data[stock_symbol][interval_str][-2]
+        if prev_cndl["close"] == 0:
+            logging.warning("Previous candle close is 0 for {} ({}). Skipping pct change calc.".format(name, interval_str))
+            return
+        price_change_pct = ((cndl["close"] - prev_cndl["close"]) / prev_cndl["close"]) * 100
+        
+        all_stock_change_details = {
+            'name': name,
+            'price_change_pct': price_change_pct,
+            'close': cndl['close'],
+            'timestamp': cndl['date'],
+            'interval': interval_str # Add interval to the details
+        }
+        self.current_poll_all_stock_changes.append(all_stock_change_details)
+
+        bull_candidate = PRICE_CHANGE_THRESHOLD_MIN_PCT <= price_change_pct <= PRICE_CHANGE_THRESHOLD_MAX_PCT
+        bear_candidate = -PRICE_CHANGE_THRESHOLD_MAX_PCT <= price_change_pct <= -PRICE_CHANGE_THRESHOLD_MIN_PCT
+        logging.debug("{} ({}) Check|PriceChg:{}% (PrevC:{}:{}) => Bull:{} Bear:{}".format(name, interval_str, price_change_pct, prev_cndl['close'], cndl['close'], bull_candidate, bear_candidate))
+
+        if bull_candidate or bear_candidate:
+            alert_type = "Bullish" if bull_candidate else "Bearish"
+            movement_direction = "up" if bull_candidate else "down"
+            
+            mover_details_for_summary = {
+                'name': name, 
+                'price_change_pct': price_change_pct, 
+                'close': cndl['close'],
+                'direction': alert_type,
+                'timestamp': cndl['date'],
+                'interval': interval_str # Add interval to the details
+            }
+            self._add_to_poll_summary(mover_details_for_summary)
+
+            telegram_message_early = (
+                "*Early Price Movement Alert ({})*\n\n"
+                "Stock: `{}` has moved {} by `{}%`\n"
+                "Current Price: `{}` (Prev Close: `{}`)\n"
+                "Candle Time: `{}`\n"
+                "Interval: `{}`\n"
+                "Note: Further checks (volume, cooldown) pending for trade signal."
+            ).format(interval_str, name, movement_direction, price_change_pct, cndl['close'], prev_cndl['close'], cndl['date'].strftime('%Y-%m-%d %H:%M:%S'), interval_str)
+            self.send_telegram_notification(telegram_message_early)
+
+        volumes = [c.get("volume",0) for c in self.candles_data[stock_symbol][interval_str][:-1]]; avg_vol = compute_sma(volumes, VOLUME_AVG_PERIOD)
+        curr_vol = cndl.get("volume",0); vol_ok = False; req_vol = 0.0
+        if avg_vol is not None and avg_vol > 0: req_vol = avg_vol*VOL_MULTIPLIER; vol_ok = curr_vol > req_vol
+        elif avg_vol == 0 and curr_vol > 0: vol_ok = True 
+        log_avg_vol_str = "{}" if avg_vol is not None else "N/A"
+        logging.debug("{} ({}) Check|Vol:Curr={} Avg({})={} Req>{} => VolOK:{}".format(name, interval_str, curr_vol, VOLUME_AVG_PERIOD, log_avg_vol_str, req_vol, vol_ok))
+
+        bull_sig = ALLOW_BULLISH_SIGNALS and bull_candidate and (cndl["close"] > cndl["open"]) and vol_ok
+        bear_sig = ALLOW_BEARISH_SIGNALS and bear_candidate and (cndl["close"] < cndl["open"]) and vol_ok
+        logging.debug("{} ({}) Result|FinalSignal: Bull={} Bear={}".format(name, interval_str, 'YES' if bull_sig else 'NO', 'YES' if bear_sig else 'NO'))
+        
+        current_candle_timestamp = cndl["date"]
+        if bull_sig:
+            with self.cooldown_locks[stock_symbol]:
+                last_alert = self.cooldowns[stock_symbol].get("lastBullAlert")
+                if not last_alert or (current_candle_timestamp - last_alert).total_seconds() >= COOLDOWN_MINS_STOCK * 60:
+                    self.cooldowns[stock_symbol]["lastBullAlert"] = current_candle_timestamp
+                    log_msg = "Bullish CONFIRMED for {} ({}) at {} (Candle: {})!".format(name, interval_str, cndl['close'], current_candle_timestamp)
+                    logging.info(log_msg); play_sound()
+                    
+                    telegram_message_signal = (
+                        "*Trade Signal: Bullish ({})*\n\n"
+                        "Stock: `{}`\n"
+                        "Signal Price: `{}`\n"
+                        "Candle Time: `{}`\n"
+                        "Interval: `{}`\n"
+                        "Reason: Price/Volume Breakout, Cooldown OK."
+                    ).format(interval_str, name, cndl['close'], current_candle_timestamp.strftime('%Y-%m-%d %H:%M:%S'), interval_str)
+                    self.send_telegram_notification(telegram_message_signal)
+                    
+                    self.place_equity_trade_and_notify(stock_symbol, "bullish", cndl['close'])
+                else: logging.info("{} ({}) Bullish signal for {} ignored due to cooldown. Last alert: {}".format(name, interval_str, current_candle_timestamp, last_alert))
+        if bear_sig:
+            with self.cooldown_locks[stock_symbol]:
+                last_alert = self.cooldowns[stock_symbol].get("lastBearAlert")
+                if not last_alert or (current_candle_timestamp - last_alert).total_seconds() >= COOLDOWN_MINS_STOCK * 60:
+                    self.cooldowns[stock_symbol]["lastBearAlert"] = current_candle_timestamp
+                    log_msg = "Bearish CONFIRMED for {} ({}) at {} (Candle: {})!".format(name, interval_str, cndl['close'], current_candle_timestamp)
+                    logging.info(log_msg); play_sound()
+
+                    telegram_message_signal = (
+                        "*Trade Signal: Bearish ({})*\n\n"
+                        "Stock: `{}`\n"
+                        "Signal Price: `{}`\n"
+                        "Candle Time: `{}`\n"
+                        "Interval: `{}`\n"
+                        "Reason: Price/Volume Breakdown, Cooldown OK."
+                    ).format(interval_str, name, cndl['close'], current_candle_timestamp.strftime('%Y-%m-%d %H:%M:%S'), interval_str)
+                    self.send_telegram_notification(telegram_message_signal)
+
+                    self.place_equity_trade_and_notify(stock_symbol, "bearish", cndl['close'])
+                else: logging.info("{} ({}) Bearish signal for {} ignored due to cooldown. Last alert: {}".format(name, interval_str, current_candle_timestamp, last_alert))
+
+        # Update self.current_candles with the details of the candle just processed
+        self.current_candles[stock_symbol][interval_str]['date'] = cndl['date']
+        self.current_candles[stock_symbol][interval_str]['open'] = cndl['open']
+        self.current_candles[stock_symbol][interval_str]['high'] = cndl['high']
+        self.current_candles[stock_symbol][interval_str]['low'] = cndl['low']
+        self.current_candles[stock_symbol][interval_str]['close'] = cndl['close']
+        self.current_candles[stock_symbol][interval_str]['volume'] = cndl['volume']
+
+    def place_equity_trade_and_notify(self, stock_symbol, signal_type, entry_price):
+        cfg = self.stock_configs.get(stock_symbol)
+        if not cfg: logging.error("Config not found for stock {} in place_equity_trade. Skipping.".format(stock_symbol)); return
+
+        qty = cfg["quantity"]; exch = cfg["exchange"]; sl_pct = cfg["sl_pct"]; tgt_pct = cfg["target_pct"]
+        sl_val_offset = round(entry_price * (sl_pct / 100.0), 2)
+        tgt_val_offset = round(entry_price * (tgt_pct / 100.0), 2)
+        
+        if signal_type == "bullish": main_txn_type = self.kite.TRANSACTION_TYPE_BUY
+        elif signal_type == "bearish": main_txn_type = self.kite.TRANSACTION_TYPE_SELL
+        else: logging.error("Unknown signal type: {} for {}".format(signal_type, stock_symbol)); return
+
+        logging.info("Preparing {} trade for {}: Qty={}, Entry(approx)={}, SLOffsetVal={}, TargetOffsetVal={}".format(signal_type, stock_symbol, qty, entry_price, sl_val_offset, tgt_val_offset))
+        self.place_market_and_sl_orders_equity(stock_symbol, qty, sl_val_offset, tgt_val_offset, exch, main_txn_type, entry_price)
+
+    def send_telegram_notification(self, message_text):
+        if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+            logging.warning("Telegram Bot Token or Chat ID(s) not set. Skipping notification.")
+            return
+        
+        # Ensure TELEGRAM_CHAT_ID is a list, even if it was a single string before
+        chat_ids_to_notify = TELEGRAM_CHAT_ID
+        if isinstance(TELEGRAM_CHAT_ID, str):
+            chat_ids_to_notify = [TELEGRAM_CHAT_ID]
+
+        for chat_id in chat_ids_to_notify:
+            if not chat_id: # Skip if a chat_id in the list is empty or None
+                logging.warning("Empty chat_id found in TELEGRAM_CHAT_ID list. Skipping this ID.")
+                continue
+            url = "https://api.telegram.org/bot{}/sendMessage".format(TELEGRAM_BOT_TOKEN)
+            payload = {
+                'chat_id': chat_id.strip(), # Ensure no leading/trailing spaces
+                'text': message_text,
+                'parse_mode': 'Markdown' 
+            }
+            try:
+                response = requests.post(url, data=payload, timeout=10)
+                response.raise_for_status() 
+                logging.info("Telegram notification sent to {}: {}...".format(chat_id, message_text[:50])) # Log only first 50 chars
+            except requests.exceptions.RequestException as e:
+                logging.error("Telegram notification error for chat_id {}: {}".format(chat_id, e))
+
+    def send_to_webhook(self, data):
+        if not data: return; data["source"] = "server"
+        try: requests.post(WEBHOOK_URL, json=data, timeout=10); logging.info("Webhook sent: {}".format(data))
+        except Exception as e: logging.error("Webhook error: {}".format(e))
+
+    def append_to_csv(self, data, csv_file=ORDERS_LOG_CSV, field_names=None):
+        if not data: return
+        default_field_names = ["timestamp", "mainOrderId", "slOrderId", "executionPrice", 
+                               "stopLossTriggerPrice", "stopLossPrice", "symbol", "quantity", 
+                               "sl_points", "target_points", "transaction_type"]
+        if field_names is None: field_names = default_field_names
+        
+        row_dict = {"timestamp": datetime.datetime.now().isoformat()}
+        for key in field_names:
+            if key != "timestamp": row_dict[key] = data.get(key, "")
+            
+        write_header = not os.path.exists(csv_file)
+        try:
+            with open(csv_file, "a", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=field_names)
+                if write_header: writer.writeheader()
+                writer.writerow(row_dict)
+            logging.info("Appended to {}: {}".format(csv_file, row_dict))
+        except Exception as e: logging.error("Error appending to {}: {}".format(csv_file, e))
+
+    def place_market_and_sl_orders_equity(self, symbol, quantity, sl_value_offset, target_value_offset, exchange, transaction_type_main, expected_entry_price):
+        main_order_id = None; prod = self.kite.PRODUCT_MIS; var = self.kite.VARIETY_REGULAR
+        try:
+            main_order_id = self.kite.place_order(tradingsymbol=symbol, exchange=exchange, transaction_type=transaction_type_main,
+                                                 quantity=quantity, variety=var, order_type=self.kite.ORDER_TYPE_MARKET,
+                                                 product=prod, validity=self.kite.VALIDITY_DAY)
+            logging.info("Main EQUITY MARKET order ({}) placed for {}".format(transaction_type_main, symbol))
+        except Exception as e: logging.error("Main equity order failed for {}: {}".format(symbol, e)); return None
+
+        exec_price = None; time.sleep(0.2) # Brief pause before checking order status
+        for _ in range(10): # Retry fetching order status for a few seconds
+            time.sleep(0.5)
+            try:
+                orders = self.kite.orders()
+                main_order = next((o for o in orders if o["order_id"] == main_order_id), None)
+                if main_order and main_order["status"] == self.kite.STATUS_COMPLETE:
+                    exec_price = main_order["average_price"]; logging.info("Main equity order for {} filled at avgPrice={}".format(symbol, exec_price))
+                    break
+                if main_order and main_order["status"] in (self.kite.STATUS_REJECTED, self.kite.STATUS_CANCELLED):
+                    logging.warning("Main equity order for {} was {}".format(symbol, main_order['status']))
+                    # Log failure before returning
+                    failed_trade_data = {"mainOrderId": main_order_id, "executionPrice": None, "symbol": symbol, "quantity": quantity, "transaction_type": transaction_type_main}
+                    self.append_to_csv(failed_trade_data) # Log this attempt
+                    return failed_trade_data 
+            except Exception as e: logging.error("Error fetching main equity order status for {}: {}".format(symbol, e)); break
+        
+        if not exec_price:
+            logging.warning("Main equity order for {} not filled or price not found. Skipping SL. Order ID: {}".format(symbol, main_order_id))
+            failed_trade_data = {"mainOrderId": main_order_id, "executionPrice": None, "symbol": symbol, "quantity": quantity, "transaction_type": transaction_type_main}
+            self.append_to_csv(failed_trade_data)
+            return failed_trade_data
+
+        # Calculate SL trigger and price based on actual execution price
+        sl_txn_type = self.kite.TRANSACTION_TYPE_SELL if transaction_type_main == self.kite.TRANSACTION_TYPE_BUY else self.kite.TRANSACTION_TYPE_BUY
+        sl_trig_px, sl_lim_px = 0.0, 0.0
+        tick_size = 0.05 # Standard tick size for most equities
+
+        if transaction_type_main == self.kite.TRANSACTION_TYPE_BUY:
+            sl_trig_px = round(exec_price - sl_value_offset, 2)
+            sl_lim_px = round(sl_trig_px - tick_size, 2) # Place limit 1 tick below trigger
+        else: # SELL (short) order
+            sl_trig_px = round(exec_price + sl_value_offset, 2)
+            sl_lim_px = round(sl_trig_px + tick_size, 2) # Place limit 1 tick above trigger
+        
+        # Ensure SL prices are valid and limit price respects trigger for SL order type
+        sl_lim_px = max(tick_size, sl_lim_px)
+        sl_trig_px = max(tick_size, sl_trig_px)
+        if sl_txn_type == self.kite.TRANSACTION_TYPE_SELL and sl_lim_px >= sl_trig_px : sl_lim_px = round(sl_trig_px - tick_size,2)
+        if sl_txn_type == self.kite.TRANSACTION_TYPE_BUY and sl_lim_px <= sl_trig_px : sl_lim_px = round(sl_trig_px + tick_size,2)
+        sl_lim_px = max(tick_size, sl_lim_px) # Final check for limit after adjustment
+
+        sl_order_id = None
+        try:
+            sl_order_id = self.kite.place_order(tradingsymbol=symbol, exchange=exchange, transaction_type=sl_txn_type, quantity=quantity,
+                                                variety=var, order_type=self.kite.ORDER_TYPE_SL, price=sl_lim_px,
+                                                trigger_price=sl_trig_px, product=prod, validity=self.kite.VALIDITY_DAY)
+            logging.info("SL order ({}) placed for {} at Trigger: {}, Limit: {}".format(sl_txn_type, symbol, sl_trig_px, sl_lim_px))
+        except Exception as e:
+            logging.error("SL order placement failed for {}: {}".format(symbol, e))
+            try: # Attempt to close position with a market order if SL placement failed
+                logging.warning("Attempting to close position for {} with MARKET order due to SL order failure.".format(symbol))
+                close_order_id = self.kite.place_order(tradingsymbol=symbol, exchange=exchange, transaction_type=sl_txn_type, 
+                                                      quantity=quantity, variety=var, order_type=self.kite.ORDER_TYPE_MARKET, 
+                                                      product=prod, validity=self.kite.VALIDITY_DAY)
+                logging.info("Position for {} closed with MARKET order ({}) due to SL failure. Close ID={}".format(symbol, sl_txn_type, close_order_id))
+            except Exception as close_e: logging.error("Failed to close position for {} after SL failure: {}".format(symbol, close_e))
+            sl_order_id = None # Ensure SL ID is None if placement failed
+
+        trade_data = {"mainOrderId": main_order_id, "slOrderId": sl_order_id, "executionPrice": exec_price,
+                      "stopLossTriggerPrice": sl_trig_px if sl_order_id else None, 
+                      "stopLossPrice": sl_lim_px if sl_order_id else None,
+                      "symbol": symbol, "quantity": quantity, "sl_points": sl_value_offset, # This is the value offset
+                      "target_points": target_value_offset, "exchange": exchange, 
+                      "transaction_type": transaction_type_main, "apikey": "PARULL11@@"} # API key seems constant
+        
+        self.append_to_csv(trade_data) # Log to orders_log.csv
+        # self.send_to_webhook(trade_data) # Send to webhook if needed and configured
+
+        if main_order_id and exec_price and sl_order_id: # Successfully placed main and SL order
+            with self.active_trades_lock:
+                self.active_trades[main_order_id] = {
+                    "symbol": symbol, "exchange": exchange, "main_order_id": main_order_id, "sl_order_id": sl_order_id,
+                    "execution_price": exec_price, "quantity": quantity, 
+                    "target_value_offset": target_value_offset, # Store the offset for target price calculation
+                    "initial_sl_value_offset": sl_value_offset, # Store the offset for SL calculation and PnL reference
+                    "stop_loss_trigger_price": sl_trig_px, "transaction_type": transaction_type_main, # BUY or SELL
+                    "is_target_trailed": False, "entry_timestamp": datetime.datetime.now()
+                }
+                logging.info("Added equity trade {} for {} to active monitoring.".format(main_order_id, symbol))
+        else: logging.warning("Trade for {} (MainID: {}) not fully set up for monitoring (ExecPx: {}, SL_ID: {})".format(symbol, main_order_id, exec_price, sl_order_id))
+        return trade_data
+
+    @Deprecated
+    def place_market_and_sl_orders(self, symbol, quantity, sl_points, target_points, exchange):
+        """DEPRECATED: Original for options. Use place_market_and_sl_orders_equity for stocks."""
+        logging.warning("Deprecated: place_market_and_sl_orders (for options) called. This is likely an error for the equity strategy.")
+        return None
+        
+    @Deprecated
+    def place_and_notify(self, index_token, signal_type):
+        """DEPRECATED: Original for options. Use place_equity_trade_and_notify for stocks."""
+        logging.warning("Deprecated: place_and_notify (for options) called. This is likely an error for the equity strategy.")
+        return
+
+    @Deprecated
+    def finalize_candle(self, index_token, completed_candle):
+        """DEPRECATED: Original for index options. Use finalize_stock_candle for stocks."""
+        logging.warning("Deprecated: finalize_candle (for index options) called. This is likely an error for the equity strategy.")
+        return
+
+    def on_ticks(self, ws, ticks):
+        # For equity strategy, primary candle data comes from polling.
+        # This WebSocket on_ticks might be used for real-time LTP for active trades if subscribed.
+        logging.debug("WebSocket Ticks Received: {}".format(ticks)) 
+
+    def on_connect(self, ws, response):
+        logging.info("Connected to WebSocket.")
+        # No automatic subscription for all 100 stocks via WebSocket for this polling strategy.
+        # Can subscribe to active trade instrument_tokens if needed for faster LTP for SL management.
+        # For now, keeping it simple: _monitor_active_trades_loop uses kite.ltp().
+        tokens_to_subscribe = [] # Example: Populate if needed for active trades
+        # with self.active_trades_lock:
+        #     for trade_info in self.active_trades.values():
+        #         if 'instrument_token' in trade_info and trade_info['instrument_token'] not in tokens_to_subscribe:
+        #             tokens_to_subscribe.append(trade_info['instrument_token'])
+        
+        if tokens_to_subscribe:
+            logging.info("Subscribing to {} tokens on WebSocket: {}".format(len(tokens_to_subscribe), tokens_to_subscribe))
+            ws.subscribe(tokens_to_subscribe)
+            ws.set_mode(ws.MODE_LTP, tokens_to_subscribe) # Or MODE_FULL if more data needed
+        else:
+            logging.info("No specific tokens for WebSocket subscription at on_connect phase.")
+
+    def on_close(self, ws, code, reason): logging.info("WebSocket closed: Code={}, Reason={}".format(code, reason))
+    def on_error(self, ws, code, reason): logging.error("WebSocket error: Code={}, Reason={}".format(code, reason))
+
+    def _get_open_positions(self):
+        net_positions_map = {}; day_positions_list = []
+        try:
+            positions_data = self.kite.positions()
+            if positions_data:
+                net_positions = positions_data.get('net', [])
+                day_positions_list = positions_data.get('day', [])
+                for pos in net_positions:
+                    # Consider only non-zero quantity positions as open
+                    if pos.get('quantity', 0) != 0:
+                        net_positions_map["{}:{}".format(pos['exchange'], pos['tradingsymbol'])] = pos
+        except Exception as e: logging.error("Error fetching Kite positions: {}".format(e))
+        return net_positions_map, day_positions_list
+
+    def _append_to_pnl_csv(self, pnl_data):
+        # Define specific field names for PnL CSV to ensure order and completeness
+        field_names = ["timestamp", "main_order_id", "symbol", "quantity", "transaction_type",
+                       "execution_price", "exit_price", "pnl", "status"]
+        self.append_to_csv(pnl_data, PNL_LOG_CSV, field_names)
+
+    def _monitor_active_trades_loop(self):
+        logging.info("Trade monitoring loop started.")
+        while True:
+            try:
+                time.sleep(MONITOR_INTERVAL_SECONDS)
+                current_open_net_positions, current_day_positions = self._get_open_positions()
+
+                trades_to_process_keys = []
+                with self.active_trades_lock: trades_to_process_keys = list(self.active_trades.keys())
+
+                for trade_key in trades_to_process_keys:
+                    trade_info = None
+                    with self.active_trades_lock: # Get latest trade_info, might have changed (e.g. trailed)
+                        if trade_key not in self.active_trades: continue # Trade removed by another check
+                        trade_info = dict(self.active_trades[trade_key]) # Work on a copy
+                    
+                    try:
+                        stock_cfg = self.stock_configs.get(trade_info['symbol'])
+                        if not stock_cfg: logging.warning("No stock_cfg for {} in monitor. Skipping trade {}".format(trade_info['symbol'], trade_key)); continue
+
+                        instrument_ws_key = "{}:{}".format(trade_info['exchange'], trade_info['symbol'])
+                        ltp_data = self.kite.ltp(instrument_ws_key)
+                        ltp = ltp_data.get(instrument_ws_key, {}).get('last_price') if ltp_data else None
+                        if ltp is None: logging.warning("Could not fetch LTP for {}".format(instrument_ws_key)); continue
+
+                        exit_price = None; pnl = 0.0; status_msg = ""; remove_trade_flag = False
+
+                        # 1. Check SL Order Status via API
+                        sl_order_history = self.kite.order_history(order_id=trade_info['sl_order_id'])
+                        if sl_order_history:
+                            for order_update in reversed(sl_order_history):
+                                if order_update.get('status') == self.kite.STATUS_COMPLETE:
+                                    exit_price = order_update.get('average_price', ltp) # Fallback to LTP if avg_price missing
+                                    status_msg = "TARGET_TRAILED_SL_HIT" if trade_info['is_target_trailed'] else "SL_HIT_SYSTEM"
+                                    logging.info("SL order {} for {} (Trade: {}) COMPLETED at {}".format(trade_info['sl_order_id'], trade_info['symbol'], trade_key, exit_price))
+                                    remove_trade_flag = True; break
+                                elif order_update.get('status') in [self.kite.STATUS_REJECTED, self.kite.STATUS_CANCELLED]:
+                                    logging.warning("SL order {} for {} is {}".format(trade_info['sl_order_id'], trade_info['symbol'], order_update.get('status')))
+                                    # If SL is cancelled/rejected, position is vulnerable. Consider closing or alerting.
+                                    # For now, we will rely on portfolio check or manual intervention.
+                                    break 
+                        
+                        # 2. If SL hit by system, calculate PNL and flag for removal
+                        if remove_trade_flag:
+                            if trade_info['transaction_type'] == self.kite.TRANSACTION_TYPE_BUY:
+                                pnl = (exit_price - trade_info['execution_price']) * trade_info['quantity']
+                            else: # SELL (short)
+                                pnl = (trade_info['execution_price'] - exit_price) * trade_info['quantity']
+                        
+                        # 3. If not removed yet, check portfolio for external closure
+                        elif not current_open_net_positions.get(instrument_ws_key):
+                            logging.info("Trade {} for {} appears externally closed (not in net positions)".format(trade_key, trade_info['symbol']))
+                            status_msg = "CLOSED_EXTERNALLY"
+                            exit_price = ltp # Use current LTP as an approximate exit price for PNL calculation
+                            if trade_info['transaction_type'] == self.kite.TRANSACTION_TYPE_BUY:
+                                pnl = (exit_price - trade_info['execution_price']) * trade_info['quantity']
+                            else: # SELL (short)
+                                pnl = (trade_info['execution_price'] - exit_price) * trade_info['quantity']
+                            remove_trade_flag = True
+
+                        # 4. Trailing Stop-Loss Logic (if still open and target not yet trailed)
+                        if not remove_trade_flag and not trade_info['is_target_trailed']:
+                            target_price = 0.0; new_sl_trigger = 0.0; new_sl_limit = 0.0; trail_sl = False
+                            tick_size = 0.05
+
+                            if trade_info['transaction_type'] == self.kite.TRANSACTION_TYPE_BUY:
+                                target_price = round(trade_info['execution_price'] + trade_info['target_value_offset'], 2)
+                            if ltp >= target_price:
+                                    # Trail SL to lock in configured percentage of profit from entry
+                                    new_sl_trigger = round(trade_info['execution_price'] * (1 + stock_cfg['trail_sl_profit_pct'] / 100.0), 2)
+                                    new_sl_limit = round(new_sl_trigger - tick_size, 2)
+                                    if new_sl_trigger > trade_info['stop_loss_trigger_price']: trail_sl = True
+                            
+                            elif trade_info['transaction_type'] == self.kite.TRANSACTION_TYPE_SELL: # Short sell
+                                target_price = round(trade_info['execution_price'] - trade_info['target_value_offset'], 2)
+                                if ltp <= target_price: # Price fell to target
+                                    new_sl_trigger = round(trade_info['execution_price'] * (1 - stock_cfg['trail_sl_profit_pct'] / 100.0), 2)
+                                    new_sl_limit = round(new_sl_trigger + tick_size, 2)
+                                    if new_sl_trigger < trade_info['stop_loss_trigger_price']: trail_sl = True
+                            
+                            if trail_sl:
+                                logging.info("Target {:.2f} hit for {} (LTP: {:.2f}). Attempting to trail SL to Trig:{:.2f}, Lim:{:.2f}.".format(target_price, trade_info['symbol'], ltp, new_sl_trigger, max(tick_size, new_sl_limit)))
+                                try:
+                                    self.kite.modify_order(variety=self.kite.VARIETY_REGULAR, order_id=trade_info['sl_order_id'],
+                                                           trigger_price=new_sl_trigger, price=max(tick_size, new_sl_limit))
+                                    with self.active_trades_lock:
+                                        if trade_key in self.active_trades: # Re-check as it might have been closed
+                                            self.active_trades[trade_key]['is_target_trailed'] = True
+                                            self.active_trades[trade_key]['stop_loss_trigger_price'] = new_sl_trigger
+                                            logging.info("Successfully trailed SL for {} (Trade: {}). New Trig: {:.2f}".format(trade_info['symbol'], trade_key, new_sl_trigger))
+                                            # Send Telegram notification for successful SL trail
+                                            trail_msg = (
+                                                "*Trailing SL Activated*\\n\\n"
+                                                "Stock: `{}`\\n"
+                                                "Original Entry: `{:.2f}`\\n"
+                                                "LTP at Trail: `{:.2f}`\\n"
+                                                "New SL Trigger: `{:.2f}`\\n"
+                                                "(Trade ID: `{}`)"
+                                            ).format(trade_info['symbol'], trade_info['execution_price'], ltp, new_sl_trigger, trade_key)
+                                            self.send_telegram_notification(trail_msg)
+                                except Exception as mod_e: 
+                                    logging.error("Failed to trail SL for {} (Trade: {}): {}".format(trade_info['symbol'], trade_key, mod_e))
+                        
+                        # If trade was flagged for removal (SL hit or external closure)
+                        if remove_trade_flag:
+                            pnl_entry = {"main_order_id": trade_info['main_order_id'], "symbol": trade_info['symbol'],
+                                         "quantity": trade_info['quantity'], "transaction_type": trade_info['transaction_type'],
+                                         "execution_price": trade_info['execution_price'], "exit_price": exit_price,
+                                         "pnl": pnl, "status": status_msg}
+                            self._append_to_pnl_csv(pnl_entry)
+                            with self.active_trades_lock:
+                                if trade_key in self.active_trades: del self.active_trades[trade_key]
+                            logging.info("Removed closed trade {} ({}) from active monitoring. PnL: {}".format(trade_key, trade_info['symbol'], pnl))
+
+                    except Exception as trade_loop_err:
+                        logging.error("Error processing trade {} ({}): {}".format(trade_key, trade_info.get('symbol','N/A'), trade_loop_err))
+                        traceback.print_exc()
+            
+            except Exception as outer_loop_err:
+                logging.error("Error in _monitor_active_trades_loop outer try: {}".format(outer_loop_err))
+                traceback.print_exc(); time.sleep(10) # Wait a bit before retrying the loop on major error
+
+    def _update_symbols_periodically(self): # This was for options/futures, less critical for static stock list
+        logging.info("Periodic symbol update loop started (currently no-op for static stock list).")
+        while True:
+            try:
+                # SYMBOL_UPDATE_INTERVAL_SECONDS was removed, use a fixed large interval or remove thread if not needed
+                time.sleep(3600) # e.g., every hour check if any dynamic update to stock list is needed
+                logging.info("Periodic symbol update: Currently, stock list is static from CSV at startup.")
+                # If dynamic reloading of liquid_stocks.csv is desired, implement logic here (e.g., re-call self._load_liquid_stocks() and update dependent dicts)
+            except Exception as e:
+                logging.error("Error in _update_symbols_periodically loop: {}".format(e))
+                traceback.print_exc(); time.sleep(60)
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(module)s:%(lineno)d - %(message)s')
+
+    if not os.path.exists(LIQUID_STOCKS_CSV):
+        logging.info("{} not found. Creating a dummy file. Please populate it with your stocks (SYMBOL,EXCHANGE). Example: RELIANCE,NSE")
+        with open(LIQUID_STOCKS_CSV, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f); writer.writerow(["SYMBOL", "EXCHANGE"])
+            writer.writerow(["RELIANCE", "NSE"]); writer.writerow(["TCS", "NSE"])
+
+    try:
+        kite = KiteConnect(api_key=API_KEY)
+        # IMPORTANT: Ensure ACCESS_TOKEN is valid. 
+        # You might need to generate it manually first if it's expired.
+        # Example for generating new token (requires manual step for request_token):
+        # print(f"Login URL: {kite.login_url()}")
+        # request_token = input("Enter request token: ")
+        # data = kite.generate_session(request_token, api_secret="YOUR_API_SECRET_HERE") # Replace with your API secret
+        # ACCESS_TOKEN = data["access_token"]
+        # logging.info(f"New Access Token generated: {ACCESS_TOKEN} - Update script constant.")
+        
+        if ACCESS_TOKEN == "YOUR_ACCESS_TOKEN":
+            logging.error("ACCESS_TOKEN is not set. Please update it in the script.")
+            exit()
+            
+        kite.set_access_token(ACCESS_TOKEN)
+        profile = kite.profile()
+        logging.info("Kite connection successful. User ID: {}, Name: {}".format(profile.get('user_id'), profile.get('user_name')))
+    except Exception as e:
+        logging.error("Kite Connect initialization failed: {}".format(e))
+        traceback.print_exc()
+        exit()
+
+    app = StrategyRunner(kite)
+    app.load_historical_candles() # Load from historical_stock_candles.csv
+    app.fetch_all_initial_stock_data() # Fetch initial 15-min data for all stocks
+    
+    # WebSocket is less critical for candle data now, primarily for potential faster LTP updates for active trades.
+    kws = KiteTicker(API_KEY, ACCESS_TOKEN)
+    kws.on_ticks = app.on_ticks; kws.on_connect = app.on_connect
+    kws.on_close = app.on_close; kws.on_error = app.on_error
+    
+    logging.info("Starting WebSocket connection (minimal usage for this polling-based strategy)...")
+    kws.connect(threaded=True)
+    # logging.info("WebSocket connect initiated in a background thread. Main strategy relies on polling.")
+
+    logging.info("Main thread running. Strategy relies on periodic data polling and active trade monitoring threads.")
+    try:
+        while True: time.sleep(60) # Keep main thread alive
+    except KeyboardInterrupt: logging.info("KeyboardInterrupt received. Closing WebSocket and exiting...")
+    except Exception as main_loop_e:
+         logging.error("Error in main keep-alive loop: {}".format(main_loop_e))
+         traceback.print_exc()
+    finally:
+        if kws and kws.is_connected(): kws.close()
+        logging.info("Exiting application.")
